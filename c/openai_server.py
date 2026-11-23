@@ -1232,6 +1232,58 @@ def _tool_hold():
     return max(len(m) for m in _tool_stream_markers()) - 1
 
 
+class ToolTextStream:
+    """A streamed answer's text with a tool call's syntax kept out of it, for every family and
+    for both API surfaces (/v1/chat/completions and /v1/messages each had this loop).
+
+    The Qwen form parses its calls as they stream (QwenToolStream). Kimi K3's calls come on
+    the engine's side channel: once it has spoken, the text is all text. Every other family
+    writes a marker: text up to it goes out, a marker-length tail is held so one split across
+    chunks is still caught, and nothing after the marker is text. The calls themselves are
+    parsed from the whole reply by the caller."""
+
+    def __init__(self, emit, tools, sideband):
+        self.emit = emit
+        self.sideband = sideband
+        self.qwen = (QwenToolStream(emit, tools) if chat_flavor() in
+                     ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
+        self.buf = ""
+        self.in_tool = False
+        self.hold = _tool_hold()
+
+    def feed(self, chunk):
+        if self.qwen is not None:
+            self.qwen.feed(chunk)
+            return
+        if self.sideband.seen:
+            self.emit(chunk)
+            return
+        if self.in_tool:
+            return                       # tool markers never reach the client as text
+        self.buf += chunk
+        cut = _tool_cut(self.buf)
+        if cut >= 0:
+            if cut:
+                self.emit(self.buf[:cut])
+            self.buf = ""
+            self.in_tool = True
+            return
+        flush = max(0, len(self.buf) - self.hold)
+        if flush:
+            self.emit(self.buf[:flush])
+            self.buf = self.buf[flush:]
+
+    def finish(self):
+        """The end of the reply: the held tail goes out when no call began. Returns the Qwen
+        form's calls, parsed as they streamed, or None when the caller parses the reply."""
+        if self.qwen is not None:
+            return self.qwen.finish()
+        if not self.in_tool and self.buf:
+            self.emit(self.buf)
+        self.buf = ""
+        return None
+
+
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
                # kimi | olmoe | qwen36 | qwen38 | deepseek_v4)
 # The chat template the model was trained on, when it is not its engine family's (#1757):
@@ -10210,36 +10262,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # tool-call marker split across engine chunks is still caught.
-                sp = {"buf": "", "tool": False}
-                hold = _tool_hold()
                 raw = []
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
                                         ignore_leading_stop)
-                qwen_stream = (QwenToolStream(emit, tools) if chat_flavor() in
-                               ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
+                tool_text = ToolTextStream(emit, tools, sideband)
 
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
-                    if qwen_stream is not None:
-                        qwen_stream.feed(chunk)
-                        return
-                    if sideband.seen:
-                        emit(chunk)
-                        return
-                    if sp["tool"]:
-                        return
-                    sp["buf"] += chunk
-                    cut = _tool_cut(sp["buf"])
-                    if cut >= 0:
-                        if cut:
-                            emit(sp["buf"][:cut])
-                        sp["buf"] = ""
-                        sp["tool"] = True
-                        return
-                    flush = max(0, len(sp["buf"]) - hold)
-                    if flush:
-                        emit(sp["buf"][:flush])
-                        sp["buf"] = sp["buf"][flush:]
+                    tool_text.feed(chunk)
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
@@ -10272,11 +10302,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband.finish()
                 if think:
                     think.finish()
-                if qwen_stream is not None:
-                    calls = qwen_stream.finish()
-                else:
-                    if not sp["tool"] and sp["buf"]:
-                        emit(sp["buf"])                 # no tool call happened: flush held tail
+                calls = tool_text.finish()             # no tool call happened: the held tail
+                if calls is None:
                     _content, calls = parse_arch_tool_calls("".join(raw), tools,
                                                             sideband.reply())
                 for i, tc in enumerate(calls):
@@ -10740,13 +10767,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
-        # GLM-5.3 opens <think> in the prompt even with thinking off (#1278), so its reply
-        # starts with reasoning either way. Split it off so the answer never carries the
-        # reasoning or a literal </think>, but only return it as a thinking block when the
+        # GLM-5.3 opens <think> in the prompt even with thinking off (#1278), and Flint,
+        # Muse Spark and Mistral-Large-4 open it themselves, so a reply can carry reasoning
+        # either way. It is always split off, as on the OpenAI path, so the answer never
+        # carries the reasoning or a marker, but only returned as a thinking block when the
         # client asked for thinking: the real API never sends one otherwise, and clients
         # read the answer from content[0].
-        split_reasoning = enable_thinking or starts_in_reasoning(enable_thinking,
-                                                                 add_generation_prompt)
 
         def blocks_and_stop(text, stats, tool_reply=None, matched=None):
             """Split a finished reply into Anthropic content blocks, stop_reason and
@@ -10755,7 +10781,7 @@ class APIHandler(BaseHTTPRequestHandler):
             reasoning = ""
             if ARCH == "inkling":
                 text, reasoning = ink_split(text, tools)
-            elif split_reasoning:
+            else:
                 reasoning, text = split_thinking_reply(text, enable_thinking,
                                                        add_generation_prompt)
             if enable_thinking:
@@ -10856,7 +10882,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
             text_index = 1 if enable_thinking else 0
             stream_state = {"thinking_closed": not enable_thinking,
-                            "text_started": not enable_thinking}
+                            "text_started": not enable_thinking, "blank": ""}
             if enable_thinking:
                 send_event("content_block_start", {"type": "content_block_start", "index": 0,
                     "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
@@ -10871,12 +10897,18 @@ class APIHandler(BaseHTTPRequestHandler):
             raw = []
             sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
                                     ignore_leading_stop)
-            state = {"buf": "", "in_tool": False}
-            hold = _tool_hold()
 
             def emit_text(chunk):
                 if not chunk:
                     return
+                if not stream_state["thinking_closed"]:
+                    # The thinking block ends before the text block starts. Blank text ahead
+                    # of it waits: a model that opens <think> itself may write a newline first.
+                    stream_state["blank"] += chunk
+                    if not stream_state["blank"].strip():
+                        return
+                    chunk, stream_state["blank"] = stream_state["blank"], ""
+                    close_thinking()
                 if not stream_state["text_started"]:
                     stream_state["text_started"] = True
                     send_event("content_block_start", {"type": "content_block_start",
@@ -10884,37 +10916,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_delta", {"type": "content_block_delta",
                     "index": text_index, "delta": {"type": "text_delta", "text": chunk}})
 
-            def emit_answer(chunk):
-                if not tools:
-                    emit_text(chunk)
-                    return
-                if qwen_stream is not None:
-                    qwen_stream.feed(chunk)
-                    return
-                if sideband.seen:
-                    emit_text(chunk)
-                    return
-                if state["in_tool"]:
-                    return                       # tool markers never reach the client as text
-                state["buf"] += chunk
-                cut = _tool_cut(state["buf"])
-                if cut >= 0:
-                    if cut:
-                        emit_text(state["buf"][:cut])
-                    state["buf"] = ""
-                    state["in_tool"] = True
-                    return
-                flush = max(0, len(state["buf"]) - hold)
-                if flush:
-                    emit_text(state["buf"][:flush])
-                    state["buf"] = state["buf"][flush:]
-
-            qwen_stream = (QwenToolStream(emit_text, tools) if tools and chat_flavor() in
-                           ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
+            tool_text = ToolTextStream(emit_text, tools, sideband) if tools else None
+            emit_answer = tool_text.feed if tool_text else emit_text
 
             def emit_thinking(chunk):
-                if not enable_thinking:
-                    return                       # reasoning the client did not ask for
+                if stream_state["thinking_closed"]:
+                    return                       # not asked for, or after the answer began
                 send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
                     "delta": {"type": "thinking_delta", "thinking": chunk}})
 
@@ -10934,10 +10941,11 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
                 # lo splitter serve pure col ragionamento "spento", o il
-                # pensiero finisce incollato davanti alla risposta.
-                split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if starts_in_reasoning(enable_thinking, add_generation_prompt)
-                         else None)
+                # pensiero finisce incollato davanti alla risposta. Flint, Muse Spark and
+                # Mistral-Large-4 open the block themselves: the splitter starts in text.
+                split = ThinkingStreamSplit(
+                    emit_thinking, emit_answer, close_thinking,
+                    initial_thinking=starts_in_reasoning(enable_thinking, add_generation_prompt))
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -10961,10 +10969,8 @@ class APIHandler(BaseHTTPRequestHandler):
             if split:
                 split.close()
                 close_thinking()               # budget exhaustion before </think>
-            if qwen_stream is not None:
-                qwen_stream.finish()
-            elif tools and not state["in_tool"] and state["buf"]:
-                emit_text(state["buf"])
+            if tool_text:
+                tool_text.finish()
             ka_stop.set()
             ka_thread.join(timeout=2)
             if stream_state["text_started"]:
